@@ -1,0 +1,17 @@
+[package]
+name = "virtintrd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Using nix for safe Linux syscall wrappers
+nix = { version = "0.29", default-features = false, features = ["fs", "mount", "dir", "process"] }
+# Using libc for raw syscalls (init_module)
+libc = { version = "0.2", default-features = false }
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Enable Link Time Optimization
+codegen-units = 1   # Reduce number of codegen units to increase optimizations
+panic = "abort"     # Abort on panic
+strip = true        # Strip symbols from binary

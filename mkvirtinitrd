@@ -1,0 +1,152 @@
+#!/bin/bash
+set -e
+
+declare -A COPIED_MODULES
+MODULE_COUNTER=0
+declare -a EXTRA_MODULES
+
+usage() {
+    echo "Usage: $0 [--module=<name>]... <virtintrd_binary> <modules_directory> <output_file>"
+    echo "  --module=<name>: Additional module to include (can be repeated)"
+    echo "  virtintrd_binary: Path to the virtintrd binary"
+    echo "  modules_directory: Path to kernel modules (e.g., /usr/lib/modules/6.9.9-200.fc40.x86_64)"
+    echo "  output_file: Output path for the initramfs image"
+    exit 1
+}
+
+get_module_dependencies() {
+    local module_path="$1"
+    local depends=$(modinfo -F depends "$module_path" 2>/dev/null || echo "")
+
+    if [ -z "$depends" ]; then
+        echo ""
+        return 0
+    fi
+
+    # Split comma-separated dependencies and trim whitespace
+    local deps_array=()
+    IFS=',' read -ra DEPS <<< "$depends"
+    for dep in "${DEPS[@]}"; do
+        # Trim whitespace
+        dep=$(echo "$dep" | xargs)
+        if [ -n "$dep" ]; then
+            deps_array+=("$dep")
+        fi
+    done
+
+    # Return space-separated list
+    echo "${deps_array[@]}"
+}
+
+copy_module() {
+    local modules_dir="$1"
+    local module_name="$2"
+    local dest_dir="$3"
+
+    # Check if module was already copied
+    if [[ -n "${COPIED_MODULES[$module_name]}" ]]; then
+        return 0
+    fi
+
+    local module_path=$(find "$modules_dir" -name "${module_name}.ko*" | head -n 1)
+
+    if [ -z "$module_path" ]; then
+        echo "Warning: ${module_name} module not found in $modules_dir"
+        return 1
+    fi
+
+    # Get module dependencies
+    local dependencies=$(get_module_dependencies "$module_path")
+    if [ -n "$dependencies" ]; then
+        for dep in $dependencies; do
+            copy_module "$modules_dir" "$dep" "$dest_dir"
+        done
+    fi
+
+    MODULE_COUNTER=$((MODULE_COUNTER + 1))
+    local prefix=$(printf "%03d" $MODULE_COUNTER)
+
+    local module_file=$(basename "$module_path")
+    local dest_file="${dest_dir}/${prefix}-${module_name}.ko"
+
+    # Handle compression
+    if [[ "$module_file" == *.ko.xz ]]; then
+        xz -dc "$module_path" > "$dest_file"
+    elif [[ "$module_file" == *.ko.zst ]]; then
+        zstd -dc "$module_path" > "$dest_file"
+    elif [[ "$module_file" == *.ko.gz ]]; then
+        gzip -dc "$module_path" > "$dest_file"
+    else
+        cp "$module_path" "$dest_file"
+    fi
+
+    COPIED_MODULES[$module_name]=1
+    return 0
+}
+
+# Parse command-line arguments
+POSITIONAL_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --module=*)
+            EXTRA_MODULES+=("${1#*=}")
+            shift
+            ;;
+        --module)
+            if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
+                EXTRA_MODULES+=("$2")
+                shift 2
+            else
+                echo "Error: --module requires a module name"
+                usage
+            fi
+            ;;
+        -*)
+            echo "Error: Unknown option $1"
+            usage
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Check we have the required 3 positional arguments
+if [ ${#POSITIONAL_ARGS[@]} -lt 3 ]; then
+    usage
+fi
+
+BINARY_PATH="${POSITIONAL_ARGS[0]}"
+MODULES_DIR="${POSITIONAL_ARGS[1]}"
+OUTPUT_FILE="${POSITIONAL_ARGS[2]}"
+
+if [ ! -f "$BINARY_PATH" ]; then
+    echo "Error: Binary not found at $BINARY_PATH"
+    exit 1
+fi
+
+if [ ! -d "$MODULES_DIR" ]; then
+    echo "Error: Modules directory '$MODULES_DIR' does not exist"
+    exit 1
+fi
+
+ROOTFS=$(mktemp -d)
+trap "rm -rf $ROOTFS" EXIT
+
+mkdir -p $ROOTFS/usr/lib/modules $ROOTFS/bin
+
+cp "$BINARY_PATH" $ROOTFS/init
+chmod +x $ROOTFS/init
+strip $ROOTFS/init 2>/dev/null || true
+
+# Copy virtiofs module
+copy_module "$MODULES_DIR" "virtiofs" "$ROOTFS/usr/lib/modules"
+
+# Copy additional modules if specified
+for module in "${EXTRA_MODULES[@]}"; do
+    echo "Copying additional module: $module"
+    copy_module "$MODULES_DIR" "$module" "$ROOTFS/usr/lib/modules"
+done
+
+(cd $ROOTFS; find . -print0 | cpio --null --create --format=newc --quiet) > "$OUTPUT_FILE"

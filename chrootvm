@@ -1,0 +1,205 @@
+#!/usr/bin/bash
+
+declare -A EXTRA_MOUNTS=()
+declare -A EXTRA_MOUNTS_RO=()
+DEBUG_FLAG=""
+
+# Parse command line arguments
+POSITIONAL_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --mount)
+            if [[ $# -lt 3 ]]; then
+                echo "Error: --mount requires two arguments: tag and path"
+                exit 1
+            fi
+            EXTRA_MOUNTS[$2]="$3"
+            shift 3
+            ;;
+        --mount-ro)
+            if [[ $# -lt 3 ]]; then
+                echo "Error: --mount requires two arguments: tag and path"
+                exit 1
+            fi
+            EXTRA_MOUNTS[$2]="$3"
+            EXTRA_MOUNTS_RO[$2]=1
+            shift 3
+            ;;
+        --debug)
+            DEBUG_FLAG="debug"
+            shift
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Set positional arguments
+set -- "${POSITIONAL_ARGS[@]}"
+ROOTFS=$1
+INIT_ARG=${2:-/bin/sh}
+
+# Create temporary directory for this run
+TMPDIR=$(mktemp -d -t chrootvm.XXXXXX)
+trap "rm -rf '$TMPDIR'" EXIT
+
+# Resolve INIT to full path if relative
+if [[ "$INIT_ARG" != /* ]]; then
+    # Search in standard PATH locations within the rootfs
+    INIT=""
+    for dir in /usr/bin /usr/sbin /bin /sbin /usr/local/bin /usr/local/sbin; do
+        if [ -f "$ROOTFS$dir/$INIT_ARG" ]; then
+            INIT="$dir/$INIT_ARG"
+            break
+        fi
+    done
+
+    if [ -z "$INIT" ]; then
+        echo "Error: init program '$INIT_ARG' not found in standard PATH"
+        exit 1
+    fi
+else
+    # Absolute path specified
+    INIT="$INIT_ARG"
+    if [ ! -f "$ROOTFS$INIT" ]; then
+        echo "Error: init program '$INIT' not found in rootfs"
+        exit 1
+    fi
+fi
+
+# Find the latest kernel version from $ROOTFS/usr/lib/modules
+KERNEL_VERSION=$(ls -1 "$ROOTFS/usr/lib/modules" 2>/dev/null | sort -V | tail -n 1)
+
+if [ -z "$KERNEL_VERSION" ]; then
+    echo "Error: No kernel version found in $ROOTFS/usr/lib/modules"
+    exit 1
+fi
+
+# Try to find the kernel in common locations
+if [ -f "$ROOTFS/usr/lib/modules/$KERNEL_VERSION/vmlinuz" ]; then
+    KERNEL="$ROOTFS/usr/lib/modules/$KERNEL_VERSION/vmlinuz"
+else
+    echo "Error: Kernel not found for version $KERNEL_VERSION"
+    exit 1
+fi
+
+INITRD="$TMPDIR/initrd.img"
+./mkvirtinitrd target/x86_64-unknown-linux-musl/release/virtintrd "$ROOTFS/usr/lib/modules/$KERNEL_VERSION/" "$INITRD"
+
+# Helper function to find qemu binary
+find_qemu_binary() {
+    local arch=$(uname -m)
+    local qemu_names=(
+        "qemu-system-${arch}"
+        "qemu-kvm"
+    )
+
+    local qemu_paths=(
+        "/usr/bin"
+        "/usr/libexec"
+        "/usr/local/bin"
+        "/bin"
+    )
+
+    # First, try to find in PATH
+    for name in "${qemu_names[@]}"; do
+        if command -v "$name" &>/dev/null; then
+            echo "$name"
+            return 0
+        fi
+    done
+
+    # If not in PATH, search in common locations
+    for path in "${qemu_paths[@]}"; do
+        for name in "${qemu_names[@]}"; do
+            if [ -x "$path/$name" ]; then
+                echo "$path/$name"
+                return 0
+            fi
+        done
+    done
+
+    echo "Error: qemu binary not found for architecture $arch" >&2
+    exit 1
+}
+
+CHARDEV_COUNTER=0
+next_chardev_id() {
+    CHARDEV_ID="char${CHARDEV_COUNTER}"
+    ((CHARDEV_COUNTER++))
+}
+
+add_virtiofs() {
+    local tag=$1
+    next_chardev_id
+    local chardev_id="$CHARDEV_ID"
+    local socket_path="$TMPDIR/shared.$tag"
+
+    QEMU_ARGS+=(
+        -chardev "socket,id=$chardev_id,path=$socket_path"
+        -device "vhost-user-fs-pci,queue-size=1024,chardev=$chardev_id,tag=$tag"
+    )
+}
+
+declare -A MOUNTS=()
+declare -A MOUNTS_RO=()
+
+set -x
+
+MOUNTS[rootfs]="$ROOTFS"
+for tag in "${!EXTRA_MOUNTS[@]}"; do
+    MOUNTS[$tag]="${EXTRA_MOUNTS[$tag]}"
+    MOUNTS_RO[$tag]="${EXTRA_MOUNTS_RO[$tag]}"
+done
+
+# Start virtiofsd for each mount
+for tag in "${!MOUNTS[@]}"; do
+    path="${MOUNTS[$tag]}"
+    socket_path="$TMPDIR/shared.$tag"
+
+    args=""
+    if [[ -v MOUNTS_RO["$tag"] ]]; then
+        args="--readonly"
+    fi
+
+    /usr/libexec/virtiofsd --socket-path="$socket_path" $args --sandbox=none --shared-dir "$path" &
+done
+
+MEMORY="4G"
+COMMANDLINE="console=ttyS0 quiet init=$INIT"
+QEMU=$(find_qemu_binary)
+
+for tag in "${!EXTRA_MOUNTS[@]}"; do
+    if [[ -v MOUNTS_RO["$tag"] ]]; then
+        COMMANDLINE="$COMMANDLINE mount-ro=$tag"
+    else
+        COMMANDLINE="$COMMANDLINE mount=$tag"
+    fi
+done
+
+if [[ -n "$DEBUG_FLAG" ]]; then
+    COMMANDLINE="$COMMANDLINE $DEBUG_FLAG"
+fi
+
+QEMU_ARGS=(
+    "$QEMU"
+    --nographic
+    -kernel "$KERNEL"
+    -initrd "$INITRD"
+    -append "$COMMANDLINE"
+    -m "$MEMORY"
+    -object "memory-backend-memfd,id=mem0,size=$MEMORY,share=on"
+    -numa node,memdev=mem0
+)
+
+if [ -e /dev/kvm ]; then
+    QEMU_ARGS+=(-enable-kvm)
+fi
+
+for tag in "${!MOUNTS[@]}"; do
+    add_virtiofs "$tag"
+done
+
+"${QEMU_ARGS[@]}"
