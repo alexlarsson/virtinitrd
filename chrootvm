@@ -146,8 +146,6 @@ add_virtiofs() {
 declare -A MOUNTS=()
 declare -A MOUNTS_RO=()
 
-set -x
-
 MOUNTS[rootfs]="$ROOTFS"
 for tag in "${!EXTRA_MOUNTS[@]}"; do
     MOUNTS[$tag]="${EXTRA_MOUNTS[$tag]}"
