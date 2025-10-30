@@ -285,7 +285,7 @@ fn do_init() -> Result<(), Box<dyn std::error::Error>> {
 
     // Move mounts to new root if mountpoint exists
     let surviving_mounts = ["/run", "/dev", "/proc", "/sys", "/tmp"];
-    for mount_point in &surviving_mounts {
+    for mount_point in surviving_mounts {
         let dest = format!("/sysroot{}", mount_point);
         if Path::new(&dest).exists() {
             move_mount(mount_point, &dest)?;
